@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.env
+__pycache__/
+# Python
+*.pyc
+*.egg-info/
+venv/
+.venv/
+
+# Mini Claude runtime
+sessions/
+plans/
+tool-results/
