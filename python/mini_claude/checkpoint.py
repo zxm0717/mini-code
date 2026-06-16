@@ -1,15 +1,20 @@
-"""Checkpoint management — file backup and message history snapshots for rollback.
+"""Checkpoint management — git-native file snapshots + JSON message snapshots.
 
-Copy-on-Write strategy:
-- Creating a checkpoint snapshots only the message history (zero-cost).
-- File backups happen lazily, right before a file is first modified after the checkpoint.
-- At most one auto-checkpoint per turn (avoids redundant checkpoints).
+Architecture:
+- Message history → JSON files in ~/.mini-claude/checkpoints/<session_id>/
+- File snapshots → isolated private git repo (does NOT touch user's .git)
+- Atomic rollback: backup current state → restore files → restore messages
+  Any failure triggers full restore from backup (all-or-nothing).
+- Only tracks files that the Agent has actually modified (write_file / edit_file).
 """
 
 from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -20,19 +25,88 @@ if TYPE_CHECKING:
 
 CHECKPOINT_DIR = Path.home() / ".mini-claude" / "checkpoints"
 
-# Files larger than this are skipped during backup
-MAX_BACKUP_BYTES = 1_000_000  # 1 MB
-
 
 def _ensure_dir() -> None:
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def _session_checkpoint_dir(session_id: str) -> Path:
+def _session_dir(session_id: str) -> Path:
     _ensure_dir()
     d = CHECKPOINT_DIR / session_id
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+# ─── Private git repo ─────────────────────────────────────────
+
+def _git_env(session_id: str) -> dict[str, str]:
+    """Return env dict that redirects all git ops to the private checkpoint repo.
+
+    GIT_DIR     → ~/.mini-claude/checkpoints/<session>/repo/.git
+    GIT_WORK_TREE → the project root (cwd)
+
+    The user's .git is never read or written by checkpoint operations.
+    """
+    repo_dir = _session_dir(session_id) / "repo"
+    return {
+        "GIT_DIR": str(repo_dir / ".git"),
+        "GIT_WORK_TREE": str(Path.cwd()),
+        "PATH": os.environ.get("PATH", ""),
+        "HOME": os.environ.get("HOME", str(Path.home())),
+    }
+
+
+def _init_repo(session_id: str) -> None:
+    """Initialise the private checkpoint git repo (idempotent)."""
+    repo_dir = _session_dir(session_id) / "repo"
+    git_dir = repo_dir / ".git"
+    if git_dir.exists():
+        return
+
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    env = _git_env(session_id)
+    subprocess.run(["git", "init", "-q"], env=env, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.name", "mini-claude-checkpoint"],
+        env=env, check=True, capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "checkpoint@mini-claude.local"],
+        env=env, check=True, capture_output=True,
+    )
+
+
+def _git_commit(
+    session_id: str,
+    files: set[str],
+    message: str,
+) -> str | None:
+    """Stage tracked files and commit. Returns short commit hash or None."""
+    _init_repo(session_id)
+    env = _git_env(session_id)
+
+    # Stage only agent-modified files that exist on disk
+    for f in sorted(files):
+        if os.path.exists(f):
+            subprocess.run(
+                ["git", "add", "--", f],
+                env=env, capture_output=True,
+            )
+
+    # Commit (allow-empty handles the case where no tracked files changed yet)
+    result = subprocess.run(
+        ["git", "commit", "--allow-empty", "-q", "-m", message],
+        env=env, capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return None
+
+    # Get short hash
+    hash_result = subprocess.run(
+        ["git", "rev-parse", "--short", "HEAD"],
+        env=env, capture_output=True, text=True,
+    )
+    return hash_result.stdout.strip() if hash_result.returncode == 0 else None
 
 
 # ─── Create ────────────────────────────────────────────────────
@@ -41,17 +115,29 @@ def create_checkpoint(
     agent: "Agent",
     label: str | None = None,
 ) -> str:
-    """Create a checkpoint, snapshotting current message history.
+    """Create a checkpoint.
 
-    File backups are lazy (copy-on-write at tool execution time).
-    Returns the 8-char hex checkpoint_id.
+    1. git commit all Agent-modified files in the private checkpoint repo.
+    2. Save message snapshot as JSON metadata alongside.
+
+    Returns 8-char hex checkpoint_id.
     """
     checkpoint_id = uuid.uuid4().hex[:8]
-    session_dir = _session_checkpoint_dir(agent.session_id)
+    session_dir = _session_dir(agent.session_id)
 
+    # Git commit tracked files
+    commit_msg = label or f"checkpoint-{checkpoint_id}"
+    commit_hash = _git_commit(
+        agent.session_id,
+        agent._agent_modified_files,
+        commit_msg,
+    )
+
+    # Save message snapshot as JSON metadata
     data: dict[str, Any] = {
         "id": checkpoint_id,
         "label": label,
+        "commit": commit_hash,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "turn_number": agent.current_turns,
         "message_snapshot": {
@@ -62,7 +148,7 @@ def create_checkpoint(
                 list(agent._openai_messages) if agent.use_openai else None
             ),
         },
-        "file_backups": {},
+        "tracked_files": sorted(agent._agent_modified_files),
     }
 
     (session_dir / f"{checkpoint_id}.json").write_text(
@@ -72,53 +158,6 @@ def create_checkpoint(
     return checkpoint_id
 
 
-# ─── CoW backup ─────────────────────────────────────────────────
-
-def backup_file_before_write(
-    session_id: str,
-    file_path: str,
-    checkpoint_id: str,
-) -> None:
-    """Copy-on-write: read the file and store its current content into the
-    checkpoint's file_backups dict.  Only backs up once per file per
-    checkpoint (first-write-wins).
-    """
-    # Nothing to backup if the file doesn't exist yet (it's a new file)
-    if not os.path.exists(file_path):
-        return
-
-    # Skip large files
-    file_size = os.path.getsize(file_path)
-    if file_size > MAX_BACKUP_BYTES:
-        from .ui import print_info
-        print_info(
-            f"Checkpoint: skipping backup of {file_path} "
-            f"({file_size / 1_000_000:.1f} MB exceeds 1 MB limit)"
-        )
-        return
-
-    cp_path = _session_checkpoint_dir(session_id) / f"{checkpoint_id}.json"
-    if not cp_path.exists():
-        return
-
-    try:
-        cp_data = json.loads(cp_path.read_text())
-    except Exception:
-        return
-
-    # first-write-wins
-    if file_path in cp_data.get("file_backups", {}):
-        return
-
-    try:
-        original = Path(file_path).read_text(encoding="utf-8")
-    except Exception:
-        return
-
-    cp_data["file_backups"][file_path] = original
-    cp_path.write_text(json.dumps(cp_data, indent=2, default=str), encoding="utf-8")
-
-
 # ─── Auto checkpoint ────────────────────────────────────────────
 
 def auto_create_checkpoint(
@@ -126,25 +165,21 @@ def auto_create_checkpoint(
     tool_name: str,
     before_destructive: bool = False,
 ) -> str | None:
-    """Auto-create a checkpoint before the first destructive tool in a turn.
+    """Auto-checkpoint before first destructive tool in a turn.
 
-    Rate-limited to one per turn to avoid redundant checkpoints.
-    Returns checkpoint_id if created, None if skipped.
+    No rate-limit per turn — the git repo naturally deduplicates
+    (if no tracked files changed, git commit is empty).
     """
     if not before_destructive:
         return None
-    if agent._last_auto_checkpoint_turn == agent.current_turns:
-        return None
-
-    agent._last_auto_checkpoint_turn = agent.current_turns
     return create_checkpoint(agent, label=f"auto-before-{tool_name}")
 
 
 # ─── List & query ───────────────────────────────────────────────
 
 def list_checkpoints(session_id: str) -> list[dict]:
-    """Return sorted list of checkpoint metadata (no file_backup contents)."""
-    session_dir = _session_checkpoint_dir(session_id)
+    """Return sorted list of checkpoint metadata."""
+    session_dir = _session_dir(session_id)
     results: list[dict] = []
     for f in sorted(session_dir.glob("*.json")):
         try:
@@ -152,9 +187,10 @@ def list_checkpoints(session_id: str) -> list[dict]:
             results.append({
                 "id": data["id"],
                 "label": data.get("label"),
+                "commit": data.get("commit", "?"),
                 "timestamp": data.get("timestamp", ""),
                 "turn_number": data.get("turn_number", 0),
-                "backup_count": len(data.get("file_backups", {})),
+                "tracked_count": len(data.get("tracked_files", [])),
             })
         except Exception:
             pass
@@ -168,8 +204,8 @@ def get_latest_checkpoint_id(session_id: str) -> str | None:
 
 
 def get_checkpoint(session_id: str, checkpoint_id: str) -> dict | None:
-    """Load a single checkpoint's full data (including file_backups)."""
-    path = _session_checkpoint_dir(session_id) / f"{checkpoint_id}.json"
+    """Load full checkpoint data from JSON."""
+    path = _session_dir(session_id) / f"{checkpoint_id}.json"
     if not path.exists():
         return None
     try:
@@ -178,10 +214,56 @@ def get_checkpoint(session_id: str, checkpoint_id: str) -> dict | None:
         return None
 
 
-# ─── Restore / rollback ─────────────────────────────────────────
+# ─── Atomic rollback ────────────────────────────────────────────
+
+def _backup_current_state(agent: "Agent") -> dict:
+    """Backup current file state to a temp directory + messages in memory.
+
+    Returns a dict that can be passed to _restore_from_backup().
+    """
+    backup: dict[str, Any] = {
+        "temp_dir": tempfile.mkdtemp(prefix="mini-claude-rollback-"),
+        "files": {},
+        "anthropic_messages": list(agent._anthropic_messages),
+        "openai_messages": list(agent._openai_messages),
+    }
+
+    for f in agent._agent_modified_files:
+        if os.path.exists(f):
+            dest = os.path.join(backup["temp_dir"], f.lstrip(os.sep).replace(os.sep, "_"))
+            try:
+                shutil.copy2(f, dest)
+                backup["files"][f] = dest
+            except Exception:
+                pass  # file might have been deleted, skip
+
+    return backup
+
+
+def _restore_from_backup(backup: dict) -> None:
+    """Restore files and messages from a backup."""
+    for f, src in backup["files"].items():
+        try:
+            Path(f).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, f)
+        except Exception:
+            pass
+
+    # Cleanup temp dir
+    try:
+        shutil.rmtree(backup["temp_dir"])
+    except Exception:
+        pass
+
 
 def restore_checkpoint(agent: "Agent", checkpoint_id: str) -> None:
-    """Rollback to a checkpoint: restore backed-up files, then message history."""
+    """Atomic rollback to a checkpoint.
+
+    1. Backup current state (files → temp dir, messages → memory copy).
+    2. Git checkout tracked files from the checkpoint commit.
+    3. Restore message history from JSON.
+    4. If any step fails → restore everything from backup (all-or-nothing).
+    """
     from .ui import print_info, print_error
 
     cp = get_checkpoint(agent.session_id, checkpoint_id)
@@ -189,47 +271,71 @@ def restore_checkpoint(agent: "Agent", checkpoint_id: str) -> None:
         print_error(f"Checkpoint {checkpoint_id} not found.")
         return
 
-    # Step 1: restore files
-    file_backups: dict[str, str] = cp.get("file_backups", {})
-    restored = 0
-    failed = 0
-    for file_path, original_content in file_backups.items():
+    commit = cp.get("commit")
+    tracked = cp.get("tracked_files", [])
+
+    if not commit:
+        print_error("Checkpoint has no git commit — nothing to rollback.")
+        return
+
+    # Step 1: backup current state
+    backup = _backup_current_state(agent)
+
+    try:
+        # Step 2: restore files from git (checkout tracked paths from commit)
+        env = _git_env(agent.session_id)
+        _init_repo(agent.session_id)
+
+        if tracked:
+            result = subprocess.run(
+                ["git", "checkout", commit, "--"] + tracked,
+                env=env, capture_output=True, text=True,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"Git checkout failed: {result.stderr.strip()}")
+
+        # Step 3: restore message history from JSON
+        msg_snapshot = cp.get("message_snapshot", {})
+        if msg_snapshot.get("anthropic_messages") and not agent.use_openai:
+            agent._anthropic_messages = msg_snapshot["anthropic_messages"]
+        if msg_snapshot.get("openai_messages") and agent.use_openai:
+            agent._openai_messages = msg_snapshot["openai_messages"]
+            if agent._openai_messages and agent._openai_messages[0].get("role") == "system":
+                agent._openai_messages[0]["content"] = agent._system_prompt
+
+        # Clear the modified-files tracker — rollback reverted all agent changes
+        agent._agent_modified_files.clear()
+
+        # Success
+        label = cp.get("label")
+        label_str = f' "{label}"' if label else ""
+        print_info(
+            f"Rolled back to checkpoint {checkpoint_id}{label_str}. "
+            f"Restored {len(tracked)} file(s)."
+        )
+
+    except Exception as exc:
+        # Step 4: failure → restore from backup
+        print_error(f"Rollback failed: {exc}")
+        print_info("Restoring previous state from backup...")
+        _restore_from_backup(backup)
+        # Restore messages too
+        agent._anthropic_messages = backup["anthropic_messages"]
+        agent._openai_messages = backup["openai_messages"]
+        print_info("Previous state restored. Nothing was changed.")
+
+    else:
+        # Success — cleanup temp backup
         try:
-            Path(file_path).parent.mkdir(parents=True, exist_ok=True)
-            Path(file_path).write_text(original_content, encoding="utf-8")
-            restored += 1
+            shutil.rmtree(backup["temp_dir"])
         except Exception:
-            failed += 1
-
-    # Step 2: restore message history
-    msg_snapshot = cp.get("message_snapshot", {})
-    if msg_snapshot.get("anthropic_messages") and not agent.use_openai:
-        agent._anthropic_messages = msg_snapshot["anthropic_messages"]
-    if msg_snapshot.get("openai_messages") and agent.use_openai:
-        agent._openai_messages = msg_snapshot["openai_messages"]
-        # Rebuild system prompt for OpenAI path (first message is always system)
-        if agent._openai_messages and agent._openai_messages[0].get("role") == "system":
-            agent._openai_messages[0]["content"] = agent._system_prompt
-
-    # Step 3: reset tracking state
-    agent._checkpoint_file_backups = {}
-    agent._last_auto_checkpoint_turn = -1
-
-    label = cp.get("label")
-    label_str = f' "{label}"' if label else ""
-    parts = [f"Rolled back to checkpoint {checkpoint_id}{label_str}."]
-    if restored:
-        parts.append(f"Restored {restored} file(s).")
-    if failed:
-        parts.append(f"({failed} failed)")
-    print_info(" ".join(parts))
+            pass
 
 
 # ─── Cleanup ────────────────────────────────────────────────────
 
 def _cleanup_session_checkpoints(session_id: str) -> None:
-    """Remove all checkpoints for a session (called on /clear)."""
-    import shutil
+    """Remove all checkpoints (JSON + private git repo) for a session."""
     d = CHECKPOINT_DIR / session_id
     if d.exists():
         shutil.rmtree(d)

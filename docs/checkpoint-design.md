@@ -78,90 +78,106 @@ Agent
 
 ## 4. 核心设计
 
-### 4.1 Copy-on-Write 策略
+### 4.1 双层存储架构
 
 ```
-时间线:
-                              ┌─ /checkpoint "before-refactor"
-                              │   (快照消息历史，不读文件)
-                              │
-  ────┬────────┬──────────────┼─────────────┬──────────────▶
-      │        │              │             │
-    Turn 1   Turn 2   [checkpoint-001]   Turn 3        Turn 4
-                                          │               │
-                                   write_file(A)    edit_file(B)
-                                   └─ 先备份 A      └─ 先备份 B
-                                      到 checkpoint    到 checkpoint
+消息历史（对话状态）          文件快照（代码状态）
+        │                         │
+        ▼                         ▼
+  JSON 文件存储              隔离式私有 Git 仓库
+ ~/.mini-claude/             ~/.mini-claude/
+ checkpoints/<sid>/          checkpoints/<sid>/
+   ├── xxx.json                └── repo/
+   └── yyy.json                    ├── .git/      ← GIT_DIR 指向这里
+                                   │   (完全独立，不碰用户 .git)
+                                   └── (commit 对象)
+                                        ↑
+                                   GIT_WORK_TREE = 项目根目录
+                                   只 git add Agent 修改过的文件
 ```
 
-**为什么选 CoW 而不是创建时全量快照？**
+**为什么文件快照用 Git 而不是 JSON？**
 
-| 方案 | 优点 | 缺点 |
-|------|------|------|
-| 创建时全量快照 | 回滚简单 | 需要扫描整个工作区，checkpoint 创建耗时 |
-| **CoW（延迟备份）** | 创建快、只备份实际被修改的文件 | 只保留每个文件的第一个版本 |
+| 维度 | JSON 内联 (v1) | Git-native (v2) |
+|------|:---:|:---:|
+| 大文件 | >1MB 跳过 | git 压缩/ pack 处理 |
+| 新建/删除文件 | ✗ 不支持 | ✓ 天然支持 |
+| 差异对比 | ✗ 需手动比对 | ✓ `git diff` / `git log` |
+| 回滚方式 | 逐文件写回 | `git checkout <commit> -- <files>` |
+| 远程备份 | ✗ | ✓ `git push` 到 GitHub |
+| 用户 .git | 不碰 | **隔离式私有仓库，同样不碰** |
 
-选择 CoW：创建 checkpoint 本身是零成本的（只写消息 JSON），文件备份推迟到真正需要时。
-
-### 4.2 存储结构
+### 4.2 隔离式私有 Git 仓库
 
 ```
-~/.mini-claude/checkpoints/
-└── <session_id>/
-    ├── a1b2c3d4.json    # checkpoint 1
-    ├── e5f6g7h8.json    # checkpoint 2
-    └── ...
+用户的仓库 (.git)           Checkpoint 私有仓库
+        │                         │
+~/project/                  ~/.mini-claude/checkpoints/<sid>/repo/
+  ├── .git/    ← 用户自己的        └── .git/    ← 完全独立
+  ├── src/                         
+  └── ...                        通过 GIT_DIR + GIT_WORK_TREE 环境变量隔离
 ```
 
-### 4.3 Checkpoint 数据格式
+每次 checkpoint 操作通过 `subprocess.run(["git", ...], env={GIT_DIR: ..., GIT_WORK_TREE: ...})` 执行，完全不影响用户的 `.git` 目录。
+
+### 4.3 只跟踪 Agent 修改的文件
+
+Agent 持有一个 `_agent_modified_files: set[str]`，每次 `write_file` / `edit_file` 执行后自动添加文件路径。Checkpoint 只 `git add` 这个集合中的文件。
+
+### 4.4 Checkpoint 数据格式（JSON 元数据）
 
 ```json
 {
     "id": "a1b2c3d4",
     "label": "before-refactoring-auth",
+    "commit": "a1b2c3d",  
     "timestamp": "2026-06-16T10:30:00Z",
     "turn_number": 5,
     "message_snapshot": {
         "anthropic_messages": [...],
         "openai_messages": null
     },
-    "file_backups": {
-        "/home/user/project/src/auth.py": "原始内容...",
-        "/home/user/project/src/config.py": "原始内容..."
-    }
+    "tracked_files": [
+        "/home/user/project/src/auth.py",
+        "/home/user/project/src/config.py"
+    ]
 }
 ```
-
-字段说明：
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `id` | `str` | 8 位 hex 唯一 ID |
-| `label` | `str \| null` | 用户自定义标签（自动创建的为 `auto-before-<toolname>`） |
-| `timestamp` | `str` | ISO 8601 UTC 时间戳 |
-| `turn_number` | `int` | 创建时所在的 agent turn |
-| `message_snapshot` | `dict` | 消息历史快照（根据当前 backend 只存一份） |
-| `file_backups` | `dict[str,str]` | 文件路径 → 原始内容（CoW 延迟填充） |
+| `label` | `str \| null` | 用户自定义标签 |
+| `commit` | `str \| null` | 私有 Git 仓库中的 commit hash |
+| `timestamp` | `str` | ISO 8601 UTC |
+| `turn_number` | `int` | 所在 turn |
+| `message_snapshot` | `dict` | 消息历史快照 |
+| `tracked_files` | `list[str]` | Agent 修改过的文件列表 |
 
-### 4.4 回滚流程
+### 4.5 原子回滚流程
 
 ```
 /rollback a1b2c3d4
   │
-  ├── 1. 加载 checkpoint JSON
+  ├── 1. _backup_current_state()
+  │     ├─ 遍历 _agent_modified_files，copy2 到临时目录
+  │     └─ 深拷贝当前 message history
   │
-  ├── 2. 遍历 file_backups，逐个恢复文件
-  │     ┌─ 文件存在 → 覆盖为原始内容
-  │     ├─ 文件不存在 → 重新创建（含父目录）
-  │     └─ 写入失败 → 跳过并计数
+  ├── 2. git checkout <commit> -- <tracked_files>
+  │     └─ 失败 → raise RuntimeError
   │
-  ├── 3. 恢复消息历史
-  │     └─ 将 _anthropic_messages 或 _openai_messages 替换为快照
+  ├── 3. 从 JSON 恢复消息历史
+  │     └─ 失败 → raise
   │
-  └── 4. 重置追踪状态
-        ├─ _checkpoint_file_backups = {}
-        └─ _last_auto_checkpoint_turn = -1
+  ├── ✅ 成功 → 清理临时目录
+  │
+  └── ❌ 任意步骤失败 → _restore_from_backup()
+        ├─ 将临时目录的文件 copy2 回原位置
+        ├─ 恢复消息历史
+        └─ 打印 "Previous state restored. Nothing was changed."
 ```
+
+
 
 ---
 
@@ -658,16 +674,17 @@ console.print(
 
 ## 6. 设计决策
 
-| 决策 | 选择 | 理由 |
-|------|------|------|
-| 备份策略 | **Copy-on-Write** | 创建 checkpoint 零成本（只写 JSON）；文件备份延迟到实际修改前 |
-| 存储格式 | **内联 JSON** | 匹配项目轻量级风格；避免多文件管理的复杂度 |
-| 大文件处理 | **>1 MB 跳过 + 警告** | 避免撑爆 `~/.mini-claude/` 目录 |
-| Git 集成 | **不做** | 保持简单；`write_file` 有 read-before-edit 保护，纯文件备份已足够覆盖场景 |
-| Sub-agent | **不触发 auto-checkpoint** | 子 agent 不应该创建检查点（它们使用 `bypassPermissions` 模式，且任务范围有限） |
-| 每 turn 限制 | **最多 1 个 auto-checkpoint** | 避免连续 destructive tool 调用产生冗余 checkpoint |
-| 文件备份粒度 | **first-write-wins** | 保留的是 checkpoint 创建时刻的原始状态（不是首次修改前的状态无法复原） |
-| Plan 模式 | **不自动创建** | Plan 模式是只读的，只有 plan file 被编辑，风险可控 |
+| 决策 | v1 (JSON) | v2 (Git-native) |
+|------|-----------|-----------------|
+| 文件备份策略 | Copy-on-Write → 内联 JSON | Git commit in private repo |
+| 存储位置 | `~/.mini-claude/checkpoints/<sid>/*.json` | 同上 + `repo/.git` |
+| 大文件 | >1MB 跳过 | Git 压缩处理，无限制 |
+| 回滚方式 | 逐文件读写 | `git checkout <commit> -- <files>` |
+| 原子性 | ✗ 部分失败 = 部分回滚 | ✓ backup → restore → verify |
+| 隔离性 | 不碰用户 .git | `GIT_DIR` + `GIT_WORK_TREE` 完全隔离 |
+| 跟踪范围 | 只备份被修改的文件 | `_agent_modified_files` 精准跟踪 |
+| Sub-agent | 不触发 | 不触发（不变） |
+| 远程备份 | ✗ | ✓ 可将 checkpoint repo push 到 GitHub |
 
 ---
 
@@ -675,35 +692,33 @@ console.print(
 
 | 文件 | 操作 | 行数变化 | 说明 |
 |------|:--:|:------:|------|
-| `python/mini_claude/checkpoint.py` | **新建** | +150 | checkpoint 核心逻辑 |
-| `python/mini_claude/agent.py` | 修改 | +60 | 状态字段、工具路由、方法、注入点 |
+| `python/mini_claude/checkpoint.py` | 重写 | ~230 | git-native：私有仓库、原子回滚 |
+| `python/mini_claude/agent.py` | 修改 | ~30 | `_agent_modified_files` 跟踪、简化注入 |
 | `python/mini_claude/tools.py` | 修改 | +30 | 工具定义、权限绕过 |
 | `python/mini_claude/__main__.py` | 修改 | +35 | REPL 命令 |
 | `python/mini_claude/ui.py` | 修改 | +2 | 欢迎信息 |
-| **合计** | | **~280 行** | |
+| **合计** | | **~330 行** | |
 
 ---
 
 ## 8. 验证方案
 
-参考现有 `test/TEST-GUIDE.md` 的手动测试风格：
-
-### 测试 1：手动 checkpoint + 回滚
+### 测试 1：手动 checkpoint + git 文件回滚
 
 ```
 $ mini-claude
 
-> 请在 /tmp/test-checkpoint.py 创建一个 hello world 脚本
+> 请创建 src/hello.py 输出 hello world
 (agent 创建文件)
 
-> /checkpoint before-refactor
-Checkpoint a1b2c3d4 created. "before-refactor"
+> /checkpoint before-edit
+Checkpoint a1b2c3d4 created. "before-edit"
 
-> 把脚本改成打印 goodbye world
+> 把 hello.py 改成输出 goodbye world
 (agent 修改文件)
 
 > /rollback
-Rolled back to checkpoint a1b2c3d4 "before-refactor". Restored 1 file(s).
+Rolled back to checkpoint a1b2c3d4 "before-edit". Restored 1 file(s).
 
 # 验证：文件已恢复为 hello world
 ```
@@ -745,14 +760,29 @@ Session restored (2 messages, 1 checkpoint(s) available).
 Rolled back to checkpoint xxx "persist-test".
 ```
 
-### 测试 5：边界情况
+### 测试 5：原子回滚失败恢复
+
+```
+# 模拟回滚过程中 git checkout 失败
+# 验证文件状态不变，消息历史不变
+# 输出: "Previous state restored. Nothing was changed."
+```
+
+### 测试 6：隔离性验证
+
+```
+# 执行 checkpoint 操作后
+$ git log  # 用户仓库无任何变化
+# 验证 ~/.mini-claude/checkpoints/<sid>/repo/ 下有 git 记录
+```
+
+### 测试 7：边界情况
 
 | 场景 | 预期行为 |
 |------|---------|
 | 无 checkpoint 时 `/rollback` | `No checkpoints to rollback to.` |
 | `/rollback invalid-id` | `Checkpoint invalid-id not found.` |
 | `/clear` 后 `/checkpoints` | `No checkpoints in this session.` |
-| 大文件 (>1MB) 修改 | 跳过备份 + 警告信息 |
-| 连续两个 destructive tool 同一 turn | 只创建 1 个 auto-checkpoint |
-| 新文件创建（文件不存在） | 不备份（`os.path.exists` 返回 False） |
-| 已删除文件的回滚 | 重新创建文件（含父目录） |
+| 连续 write_file 同一 turn | 每次写入产生独立 git commit |
+| 新文件创建 + 回滚 | 文件被删除（git checkout 到空状态） |
+| 已删除文件的回滚 | 文件被恢复 |

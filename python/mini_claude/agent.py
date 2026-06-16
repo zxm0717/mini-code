@@ -208,9 +208,8 @@ class Agent:
         # Read-before-edit: track file read timestamps (absolutePath → mtime)
         self._read_file_state: dict[str, float] = {}
 
-        # Checkpoint state
-        self._checkpoint_file_backups: dict[str, str] = {}  # path → checkpoint_id
-        self._last_auto_checkpoint_turn: int = -1
+        # Checkpoint state — track files the agent has modified (absolute paths)
+        self._agent_modified_files: set[str] = set()
 
         # MCP integration
         self._mcp_manager = McpManager()
@@ -385,8 +384,7 @@ class Agent:
         self.total_output_tokens = 0
         self.last_input_token_count = 0
         # Cleanup checkpoints
-        self._checkpoint_file_backups = {}
-        self._last_auto_checkpoint_turn = -1
+        self._agent_modified_files = set()
         from .checkpoint import _cleanup_session_checkpoints
         _cleanup_session_checkpoints(self.session_id)
         print_info("Conversation cleared.")
@@ -1009,16 +1007,16 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                     res = self._persist_large_result(tu.name, raw)
                     print_tool_result(tu.name, res)
                     tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": res})
+                    # Track modified files
+                    file_path = inp.get("file_path")
+                    if file_path and tu.name in ("write_file", "edit_file"):
+                        self._agent_modified_files.add(str(Path(file_path).resolve()))
                     continue
 
-                # Auto-checkpoint before destructive tools (once per turn)
+                # Auto-checkpoint before destructive tools
                 if tu.name in ("write_file", "edit_file", "run_shell"):
-                    from .checkpoint import auto_create_checkpoint, backup_file_before_write
-                    cid = auto_create_checkpoint(self, tu.name, before_destructive=True)
-                    if cid:
-                        file_path = inp.get("file_path")
-                        if file_path and tu.name in ("write_file", "edit_file"):
-                            backup_file_before_write(self.session_id, str(Path(file_path).resolve()), cid)
+                    from .checkpoint import auto_create_checkpoint
+                    auto_create_checkpoint(self, tu.name, before_destructive=True)
 
                 # Permission check for tools not started early
                 perm = check_permission(tu.name, inp, self.permission_mode, self._plan_file_path)
@@ -1036,6 +1034,11 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 raw = await self._execute_tool_call(tu.name, inp)
                 res = self._persist_large_result(tu.name, raw)
                 print_tool_result(tu.name, res)
+
+                # Track modified files for checkpoint git repo
+                file_path = inp.get("file_path")
+                if file_path and tu.name in ("write_file", "edit_file"):
+                    self._agent_modified_files.add(str(Path(file_path).resolve()))
 
                 if self._context_cleared:
                     self._context_cleared = False
@@ -1222,14 +1225,10 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
 
                 print_tool_call(fn_name, inp)
 
-                # Auto-checkpoint before destructive tools (once per turn)
+                # Auto-checkpoint before destructive tools
                 if fn_name in ("write_file", "edit_file", "run_shell"):
-                    from .checkpoint import auto_create_checkpoint, backup_file_before_write
-                    cid = auto_create_checkpoint(self, fn_name, before_destructive=True)
-                    if cid:
-                        file_path = inp.get("file_path")
-                        if file_path and fn_name in ("write_file", "edit_file"):
-                            backup_file_before_write(self.session_id, str(Path(file_path).resolve()), cid)
+                    from .checkpoint import auto_create_checkpoint
+                    auto_create_checkpoint(self, fn_name, before_destructive=True)
 
                 perm = check_permission(fn_name, inp, self.permission_mode, self._plan_file_path)
                 if perm["action"] == "deny":
@@ -1268,6 +1267,10 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                     results = await asyncio.gather(*[_run_oai_safe(ct) for ct in batch["items"]])
                     for ct_item, res in results:
                         self._openai_messages.append({"role": "tool", "tool_call_id": ct_item["tc"]["id"], "content": res})
+                        # Track modified files
+                        file_path = ct_item["inp"].get("file_path")
+                        if file_path and ct_item["fn"] in ("write_file", "edit_file"):
+                            self._agent_modified_files.add(str(Path(file_path).resolve()))
                 else:
                     for ct in batch["items"]:
                         if not ct["allowed"]:
@@ -1276,6 +1279,11 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                         raw = await self._execute_tool_call(ct["fn"], ct["inp"])
                         res = self._persist_large_result(ct["fn"], raw)
                         print_tool_result(ct["fn"], res)
+
+                        # Track modified files
+                        file_path = ct["inp"].get("file_path")
+                        if file_path and ct["fn"] in ("write_file", "edit_file"):
+                            self._agent_modified_files.add(str(Path(file_path).resolve()))
 
                         if self._context_cleared:
                             self._context_cleared = False
