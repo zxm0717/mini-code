@@ -168,6 +168,26 @@ tool_definitions: list[ToolDef] = [
             "required": ["query"],
         },
     },
+    {
+        "name": "create_checkpoint",
+        "description": "Create a named checkpoint to save the current conversation state and all modified files. Use this before attempting risky changes so you can rollback if needed.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "label": {"type": "string", "description": "Optional label for this checkpoint (e.g. 'before-refactoring-auth')"},
+            },
+        },
+    },
+    {
+        "name": "rollback_checkpoint",
+        "description": "Rollback to a previous checkpoint, restoring all files and conversation state. Use this to undo changes if an implementation approach didn't work out.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "checkpoint_id": {"type": "string", "description": "The ID of the checkpoint to rollback to. Leave empty to rollback to the most recent checkpoint."},
+            },
+        },
+    },
 ]
 
 # ─── Deferred tool activation ───────────────────────────────
@@ -590,7 +610,7 @@ def check_permission(
         if tool_name == "run_shell":
             return {"action": "deny", "message": "Shell commands blocked in plan mode"}
 
-    if tool_name in ("enter_plan_mode", "exit_plan_mode"):
+    if tool_name in ("enter_plan_mode", "exit_plan_mode", "create_checkpoint", "rollback_checkpoint"):
         return {"action": "allow"}
 
     if mode == "acceptEdits" and tool_name in EDIT_TOOLS:

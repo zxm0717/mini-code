@@ -208,6 +208,10 @@ class Agent:
         # Read-before-edit: track file read timestamps (absolutePath → mtime)
         self._read_file_state: dict[str, float] = {}
 
+        # Checkpoint state
+        self._checkpoint_file_backups: dict[str, str] = {}  # path → checkpoint_id
+        self._last_auto_checkpoint_turn: int = -1
+
         # MCP integration
         self._mcp_manager = McpManager()
         self._mcp_initialized = False
@@ -380,6 +384,11 @@ class Agent:
         self.total_input_tokens = 0
         self.total_output_tokens = 0
         self.last_input_token_count = 0
+        # Cleanup checkpoints
+        self._checkpoint_file_backups = {}
+        self._last_auto_checkpoint_turn = -1
+        from .checkpoint import _cleanup_session_checkpoints
+        _cleanup_session_checkpoints(self.session_id)
         print_info("Conversation cleared.")
 
     def show_cost(self) -> None:
@@ -398,6 +407,48 @@ class Agent:
             return {"exceeded": True, "reason": f"Turn limit reached ({self.current_turns} >= {self.max_turns})"}
         return {"exceeded": False}
 
+    # ─── Checkpoint ──────────────────────────────────────────
+
+    def create_manual_checkpoint(self, label: str | None = None) -> str:
+        """Create a named checkpoint. Called from /checkpoint REPL command."""
+        from .checkpoint import create_checkpoint
+        cid = create_checkpoint(self, label=label)
+        label_suffix = f' "{label}"' if label else ""
+        print_info(f"Checkpoint {cid} created.{label_suffix}")
+        return cid
+
+    def rollback_to_checkpoint(self, checkpoint_id: str) -> None:
+        """Rollback to a specific checkpoint. Called from /rollback REPL command."""
+        from .checkpoint import restore_checkpoint
+        restore_checkpoint(self, checkpoint_id)
+
+    def list_all_checkpoints(self) -> list[dict]:
+        """List checkpoints for this session."""
+        from .checkpoint import list_checkpoints
+        return list_checkpoints(self.session_id)
+
+    def _execute_create_checkpoint_tool(self, inp: dict) -> str:
+        """Model-invoked create_checkpoint tool handler."""
+        from .checkpoint import create_checkpoint
+        cid = create_checkpoint(self, label=inp.get("label"))
+        label = inp.get("label", "")
+        prefix = f'Label: "{label}". ' if label else ""
+        return f"{prefix}Checkpoint {cid} created successfully."
+
+    def _execute_rollback_checkpoint_tool(self, inp: dict) -> str:
+        """Model-invoked rollback_checkpoint tool handler."""
+        from .checkpoint import restore_checkpoint, get_latest_checkpoint_id
+        cid = inp.get("checkpoint_id")
+        if not cid:
+            cid = get_latest_checkpoint_id(self.session_id)
+            if not cid:
+                return "Error: No checkpoints exist to rollback to."
+        restore_checkpoint(self, cid)
+        return (
+            f"Successfully rolled back to checkpoint {cid}. "
+            "Conversation and files have been restored."
+        )
+
     async def compact(self) -> None:
         await self._compact_conversation()
 
@@ -408,7 +459,13 @@ class Agent:
             self._anthropic_messages = data["anthropicMessages"]
         if data.get("openaiMessages"):
             self._openai_messages = data["openaiMessages"]
-        print_info(f"Session restored ({self._get_message_count()} messages).")
+        # Check for existing checkpoints
+        from .checkpoint import list_checkpoints
+        existing = list_checkpoints(self.session_id)
+        if existing:
+            print_info(f"Session restored ({self._get_message_count()} messages, {len(existing)} checkpoint(s) available).")
+        else:
+            print_info(f"Session restored ({self._get_message_count()} messages).")
 
     def _get_message_count(self) -> int:
         return len(self._openai_messages) if self.use_openai else len(self._anthropic_messages)
@@ -656,6 +713,10 @@ class Agent:
             return await self._execute_agent_tool(inp)
         if name == "skill":
             return await self._execute_skill_tool(inp)
+        if name == "create_checkpoint":
+            return self._execute_create_checkpoint_tool(inp)
+        if name == "rollback_checkpoint":
+            return self._execute_rollback_checkpoint_tool(inp)
         # Route MCP tool calls to the MCP manager
         if self._mcp_manager.is_mcp_tool(name):
             return await self._mcp_manager.call_tool(name, inp)
@@ -950,6 +1011,15 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                     tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": res})
                     continue
 
+                # Auto-checkpoint before destructive tools (once per turn)
+                if tu.name in ("write_file", "edit_file", "run_shell"):
+                    from .checkpoint import auto_create_checkpoint, backup_file_before_write
+                    cid = auto_create_checkpoint(self, tu.name, before_destructive=True)
+                    if cid:
+                        file_path = inp.get("file_path")
+                        if file_path and tu.name in ("write_file", "edit_file"):
+                            backup_file_before_write(self.session_id, str(Path(file_path).resolve()), cid)
+
                 # Permission check for tools not started early
                 perm = check_permission(tu.name, inp, self.permission_mode, self._plan_file_path)
                 if perm["action"] == "deny":
@@ -1151,6 +1221,15 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                     inp = {}
 
                 print_tool_call(fn_name, inp)
+
+                # Auto-checkpoint before destructive tools (once per turn)
+                if fn_name in ("write_file", "edit_file", "run_shell"):
+                    from .checkpoint import auto_create_checkpoint, backup_file_before_write
+                    cid = auto_create_checkpoint(self, fn_name, before_destructive=True)
+                    if cid:
+                        file_path = inp.get("file_path")
+                        if file_path and fn_name in ("write_file", "edit_file"):
+                            backup_file_before_write(self.session_id, str(Path(file_path).resolve()), cid)
 
                 perm = check_permission(fn_name, inp, self.permission_mode, self._plan_file_path)
                 if perm["action"] == "deny":

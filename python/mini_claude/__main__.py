@@ -159,6 +159,41 @@ async def run_repl(agent: Agent) -> None:
                     print(f"    {tag} ({s.source}) — {s.description}")
             continue
 
+        # --- Checkpoint commands ---
+        if inp == "/checkpoints":
+            checkpoints = agent.list_all_checkpoints()
+            if not checkpoints:
+                print_info("No checkpoints in this session.")
+            else:
+                print_info(f"{len(checkpoints)} checkpoint(s):")
+                for cp in checkpoints:
+                    label_str = f' - "{cp["label"]}"' if cp.get("label") else ""
+                    backup_str = f" ({cp['backup_count']} file(s) backed up)" if cp.get("backup_count") else ""
+                    print(f"    [{cp['id']}] Turn {cp['turn_number']} @ {cp['timestamp']}{label_str}{backup_str}")
+            continue
+
+        if inp.startswith("/checkpoint"):
+            # /checkpoint [label]
+            parts = inp.split(" ", 1)
+            label = parts[1].strip() if len(parts) > 1 else None
+            agent.create_manual_checkpoint(label)
+            continue
+
+        if inp.startswith("/rollback"):
+            # /rollback [checkpoint_id]
+            parts = inp.split(" ", 1)
+            cid = parts[1].strip() if len(parts) > 1 else None
+            if cid:
+                agent.rollback_to_checkpoint(cid)
+            else:
+                from .checkpoint import get_latest_checkpoint_id
+                latest = get_latest_checkpoint_id(agent.session_id)
+                if latest:
+                    agent.rollback_to_checkpoint(latest)
+                else:
+                    print_info("No checkpoints to rollback to.")
+            continue
+
         # Skill invocation: /<skill-name> [args]
         if inp.startswith("/"):
             space_idx = inp.find(" ")
@@ -215,6 +250,9 @@ REPL commands:
   /compact            Manually compact conversation
   /memory             List saved memories
   /skills             List available skills
+  /checkpoint [label] Create a session checkpoint
+  /checkpoints        List all checkpoints in this session
+  /rollback [id]      Rollback to a checkpoint (latest if no ID given)
   /<skill-name>       Invoke a skill (e.g. /commit "fix types")
 
 Examples:
