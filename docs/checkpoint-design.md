@@ -72,7 +72,7 @@ Agent
 3. **快速回滚**：通过 `/rollback [id]` 恢复到 checkpoint，包括文件内容和对话历史
 4. **列表查看**：通过 `/checkpoints` 列出当前 session 所有 checkpoint
 5. **持久化**：checkpoint 跟随 session 持久化，`--resume` 后可继续使用
-6. **轻量级**：利用 JSON 文件存储，不引入外部依赖
+6. **轻量级**：利用 JSON 文件存储消息历史，文件快照用git
 
 ---
 
